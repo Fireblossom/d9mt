@@ -77,6 +77,22 @@ namespace dxvk::d9mt {
         });
       }
 
+      // Signal the worker to exit its loop and return. The thread is detached /
+      // never joined (joining during Wine PE teardown is a known hang); making
+      // run() return just lets the thread terminate on its own. Called from
+      // DxvkInstance::~DxvkInstance BEFORE wsi::quit() hands off to the macOS
+      // app-termination handshake, so the idle watcher — otherwise parked in a
+      // Wine syscall — no longer interlocks with -[NSApplication
+      // _shouldTerminate] and wedges process exit.
+      void stop() {
+        {
+          std::unique_lock<dxvk::mutex> lock(m_mutex);
+          m_stop = true;
+        }
+        m_workCond.notify_all();
+        m_idleCond.notify_all();
+      }
+
     private:
 
       dxvk::mutex              m_mutex;
@@ -85,6 +101,7 @@ namespace dxvk::d9mt {
 
       std::queue<WatchEntry>   m_queue;
       bool                     m_busy = false;
+      bool                     m_stop = false;
 
       dxvk::thread             m_thread;
 
@@ -95,8 +112,13 @@ namespace dxvk::d9mt {
 
         while (true) {
           m_workCond.wait(lock, [this] {
-            return !m_queue.empty();
+            return !m_queue.empty() || m_stop;
           });
+
+          if (m_stop) {
+            m_idleCond.notify_all();
+            return;
+          }
 
           WatchEntry entry = std::move(m_queue.front());
           m_queue.pop();
@@ -173,9 +195,12 @@ namespace dxvk::d9mt {
 
     };
 
+    CompletionWatcher* g_watcher = nullptr;
+
     CompletionWatcher& watcher() {
       // intentionally leaked, see ~CompletionWatcher comment
       static CompletionWatcher* s_watcher = new CompletionWatcher();
+      g_watcher = s_watcher;
       return *s_watcher;
     }
 
@@ -201,6 +226,15 @@ namespace dxvk::d9mt {
 
   void watcherWaitIdle() {
     watcher().waitIdle();
+  }
+
+  // Stop the watcher thread so run() returns and the thread terminates (no
+  // join). Called at backend teardown (DxvkInstance::~DxvkInstance) before
+  // wsi::quit(), so the thread is gone before the macOS termination handshake.
+  // No-op if the watcher was never created.
+  void watcherStop() {
+    if (g_watcher)
+      g_watcher->stop();
   }
 
 }

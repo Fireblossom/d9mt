@@ -247,6 +247,11 @@ namespace dxvk::d9mt {
   // have run. Backs DxvkDevice::waitForIdle.
   void watcherWaitIdle();
 
+  // Stops the watcher thread (run() returns; the thread is never joined).
+  // Called at backend teardown before the macOS app-termination handshake so
+  // the idle watcher doesn't interlock with it and wedge process exit.
+  void watcherStop();
+
   // -------------------------------------------------------------------------
   // device-lost (d9mt_watcher.cpp). Set when a submitted command buffer fails
   // to complete within the GPU watchdog timeout (D9MT_GPU_TIMEOUT_MS, default

@@ -375,6 +375,15 @@ namespace dxvk {
 
   DxvkInstance::~DxvkInstance() {
     d9mt::logf("DxvkInstance: destroyed");
+
+    // Tear the completion-watcher thread down here, BEFORE wsi::quit() hands
+    // off to the macOS app-termination handshake. Left running, the idle
+    // watcher is parked in a Wine syscall and interlocks with
+    // -[NSApplication _shouldTerminate], wedging process exit (the long
+    // standing quit hang). Drain first so any in-flight callbacks still run.
+    d9mt::watcherWaitIdle();
+    d9mt::watcherStop();
+
     wsi::quit();
   }
 
