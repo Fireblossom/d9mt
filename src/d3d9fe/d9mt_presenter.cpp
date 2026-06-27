@@ -136,16 +136,45 @@ namespace dxvk::d9mt {
   // The vendored preferred-extent/format/dirty members are app-thread-only.
   // ==========================================================================
 
+  // Phase B (triple-buffering): rotate through N proxy images so the CPU can
+  // record frame F+1 while the GPU still reads frame F's proxy, instead of the
+  // single-proxy lock-step. N = framesInFlight() (D9MT_FRAMES_IN_FLIGHT, default
+  // 3; 1 == old serialized behavior). The single serial Metal queue keeps all
+  // command buffers in FIFO order, so cross-frame proxy access is always
+  // GPU-ordered; the per-slot Rc + DxvkAccess use-count tracking handle reuse.
+  static constexpr uint32_t kMaxFramesInFlight = 4;
+
   struct PresenterState {
     std::mutex   mutex;
     HWND         hwnd  = nullptr;
     obj_handle_t view  = 0;   // CreateMetalViewFromHWND; ReleaseMetalView to free
     obj_handle_t layer = 0;   // owned by the view, not separately retained
-    Rc<DxvkImage> proxy;
+    Rc<DxvkImage> proxies[kMaxFramesInFlight];  // rotated proxy images (Phase B)
     VkExtent2D   proxyExtent = { };
+    uint64_t     acquireSeq = 0;   // app thread: slot = acquireSeq % N
+    uint64_t     presentSeq = 0;   // CS thread:  slot = presentSeq % N
   };
 
   namespace {
+    // Number of proxy images to rotate through = max frames the CPU may run
+    // ahead of the GPU. D9MT_FRAMES_IN_FLIGHT overrides; default 3 (triple
+    // buffer), clamped to [1, kMaxFramesInFlight]. 1 == old single-proxy lock-step.
+    uint32_t framesInFlight() {
+      static const uint32_t n = [] {
+        long v = 3;
+        if (const char* e = std::getenv("D9MT_FRAMES_IN_FLIGHT")) {
+          char* end = nullptr;
+          long parsed = std::strtol(e, &end, 10);
+          if (end != e && parsed >= 1)
+            v = parsed;
+        }
+        if (v < 1) v = 1;
+        if (v > long(kMaxFramesInFlight)) v = long(kMaxFramesInFlight);
+        return uint32_t(v);
+      }();
+      return n;
+    }
+
     std::mutex s_presenterMutex;
     std::unordered_map<const void*, std::unique_ptr<PresenterState>> s_presenterStates;
 
@@ -677,6 +706,13 @@ namespace dxvk {
           Rc<DxvkImage>&  image) {
     sync = PresenterSync();
 
+    // Device-lost gate: once the GPU watchdog has fired (a command buffer never
+    // completed), stop handing out drawables and report the loss so the D3D9
+    // frontend takes its device-lost path instead of feeding more work to a
+    // hung GPU. Keeps the process responsive and cleanly quittable.
+    if (d9mt::isDeviceLost())
+      return VK_ERROR_DEVICE_LOST;
+
     auto& state = d9mt::presenterState(this);
     std::lock_guard<std::mutex> lock(state.mutex);
 
@@ -697,7 +733,12 @@ namespace dxvk {
     if (vr != VK_SUCCESS)
       return vr;
 
-    image = state.proxy;
+    // Phase B: hand out the next proxy in the rotation. acquireSeq only advances
+    // on success, staying 1:1 with presentImage's presentSeq (advanced per
+    // emitted present), so acquire and present always agree on the slot.
+    uint32_t slot = uint32_t(state.acquireSeq % d9mt::framesInFlight());
+    state.acquireSeq++;
+    image = state.proxies[slot];
     m_acquireStatus = VK_SUCCESS;
     return VK_SUCCESS;
   }
@@ -715,9 +756,14 @@ namespace dxvk {
     {
       std::lock_guard<std::mutex> lock(state.mutex);
 
+      // Phase B: pick this frame's proxy slot. presentSeq advances once per
+      // presentImage call (1:1 with successful acquires), matching acquireSeq.
+      uint32_t slot = uint32_t(state.presentSeq % d9mt::framesInFlight());
+      state.presentSeq++;
+
       obj_handle_t queue = d9mt::mtlCommandQueue();
 
-      if (!state.layer || state.proxy == nullptr || !queue) {
+      if (!state.layer || state.proxies[slot] == nullptr || !queue) {
         status = VK_ERROR_OUT_OF_DATE_KHR;
       } else {
         obj_handle_t drawable = MetalLayer_nextDrawable(state.layer);
@@ -737,7 +783,7 @@ namespace dxvk {
             // the proxy extent (both set under this lock in recreateSwapChain)
             wmtcmd_blit_copy_from_texture_to_texture cp = { };
             cp.type = WMTBlitCommandCopyFromTextureToTexture;
-            cp.src = obj_handle_t(state.proxy->handle());
+            cp.src = obj_handle_t(state.proxies[slot]->handle());
             cp.src_size = { state.proxyExtent.width, state.proxyExtent.height, 1u };
             cp.dst = drawTex;
 
@@ -761,7 +807,7 @@ namespace dxvk {
             // Frame signal fires when the present command buffer retires.
             // Keep presenter + proxy alive until then.
             Rc<Presenter>  self  = this;
-            Rc<DxvkImage>  proxy = state.proxy;
+            Rc<DxvkImage>  proxy = state.proxies[slot];
 
             d9mt::watchCommandBuffer(cmdbuf, [self, proxy, frameId, tracker] {
               self->signalFrame(frameId, tracker);
@@ -951,7 +997,8 @@ namespace dxvk {
   void Presenter::destroySwapchain() {
     auto& state = d9mt::presenterState(this);
 
-    state.proxy = nullptr;
+    for (uint32_t i = 0; i < d9mt::kMaxFramesInFlight; i++)
+      state.proxies[i] = nullptr;
     state.proxyExtent = { };
   }
 
@@ -966,10 +1013,14 @@ namespace dxvk {
     if (!extent.width || !extent.height)
       return VK_NOT_READY;
 
-    if (state.proxy != nullptr
-     && state.proxyExtent.width  == extent.width
-     && state.proxyExtent.height == extent.height
-     && !m_dirtySwapchain)
+    const uint32_t N = d9mt::framesInFlight();
+
+    bool proxiesReady = state.proxyExtent.width  == extent.width
+                     && state.proxyExtent.height == extent.height
+                     && !m_dirtySwapchain;
+    for (uint32_t i = 0; proxiesReady && i < N; i++)
+      proxiesReady = state.proxies[i] != nullptr;
+    if (proxiesReady)
       return VK_SUCCESS;
 
     // resize the layer's drawables; framebuffer_only=false is REQUIRED
@@ -986,9 +1037,12 @@ namespace dxvk {
     props.pixel_format = WMTPixelFormatBGRA8Unorm;
     MetalLayer_setProps(state.layer, &props);
 
-    if (state.proxy == nullptr
-     || state.proxyExtent.width  != extent.width
-     || state.proxyExtent.height != extent.height) {
+    bool needProxies = state.proxyExtent.width  != extent.width
+                    || state.proxyExtent.height != extent.height;
+    for (uint32_t i = 0; !needProxies && i < N; i++)
+      needProxies = state.proxies[i] == nullptr;
+
+    if (needProxies) {
       DxvkImageCreateInfo info;
       info.type        = VK_IMAGE_TYPE_2D;
       info.format      = VK_FORMAT_B8G8R8A8_UNORM;
@@ -1014,44 +1068,53 @@ namespace dxvk {
       info.colorSpace  = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
       info.debugName   = "d9mt presenter proxy";
 
-      try {
-        state.proxy = m_device->createImage(info,
-          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-      } catch (const DxvkError& e) {
-        Logger::err(str::format("d9mt: Presenter: proxy creation failed: ", e.message()));
-        state.proxy = nullptr;
-        return VK_NOT_READY;
+      for (uint32_t i = 0; i < N; i++) {
+        try {
+          state.proxies[i] = m_device->createImage(info,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        } catch (const DxvkError& e) {
+          Logger::err(str::format("d9mt: Presenter: proxy creation failed: ", e.message()));
+          for (uint32_t j = 0; j < d9mt::kMaxFramesInFlight; j++)
+            state.proxies[j] = nullptr;
+          state.proxyExtent = { };
+          return VK_NOT_READY;
+        }
+
+        // Zero-init the fresh proxy so partial first presents (letterboxed
+        // dstRect) read defined black borders. Watched (empty callback) so
+        // destroyResources' watcherWaitIdle accounts for it.
+        obj_handle_t queue = d9mt::mtlCommandQueue();
+        obj_handle_t pool  = NSAutoreleasePool_alloc_init();
+        obj_handle_t cmdbuf = queue ? MTLCommandQueue_commandBuffer(queue) : 0;
+
+        if (cmdbuf) {
+          WMTRenderPassInfo pass = { };
+          pass.render_target_width  = extent.width;
+          pass.render_target_height = extent.height;
+          pass.colors[0].texture = obj_handle_t(state.proxies[i]->handle());
+          pass.colors[0].load_action = WMTLoadActionClear;
+          pass.colors[0].store_action = WMTStoreActionStore;
+          pass.colors[0].clear_color = { 0.0, 0.0, 0.0, 1.0 };
+
+          obj_handle_t enc = MTLCommandBuffer_renderCommandEncoder(cmdbuf, &pass);
+          if (enc)
+            MTLCommandEncoder_endEncoding(enc);
+
+          MTLCommandBuffer_commit(cmdbuf);
+          d9mt::watchCommandBuffer(cmdbuf, [] { });
+        }
+        NSObject_release(pool);
       }
+
+      // release any proxies beyond the active count (defensive; N is fixed
+      // per process so this only matters if the env shrank across a restart)
+      for (uint32_t i = N; i < d9mt::kMaxFramesInFlight; i++)
+        state.proxies[i] = nullptr;
 
       state.proxyExtent = extent;
 
-      // Zero-init the fresh proxy so partial first presents (letterboxed
-      // dstRect) read defined black borders. Watched (empty callback) so
-      // destroyResources' watcherWaitIdle accounts for it.
-      obj_handle_t queue = d9mt::mtlCommandQueue();
-      obj_handle_t pool  = NSAutoreleasePool_alloc_init();
-      obj_handle_t cmdbuf = queue ? MTLCommandQueue_commandBuffer(queue) : 0;
-
-      if (cmdbuf) {
-        WMTRenderPassInfo pass = { };
-        pass.render_target_width  = extent.width;
-        pass.render_target_height = extent.height;
-        pass.colors[0].texture = obj_handle_t(state.proxy->handle());
-        pass.colors[0].load_action = WMTLoadActionClear;
-        pass.colors[0].store_action = WMTStoreActionStore;
-        pass.colors[0].clear_color = { 0.0, 0.0, 0.0, 1.0 };
-
-        obj_handle_t enc = MTLCommandBuffer_renderCommandEncoder(cmdbuf, &pass);
-        if (enc)
-          MTLCommandEncoder_endEncoding(enc);
-
-        MTLCommandBuffer_commit(cmdbuf);
-        d9mt::watchCommandBuffer(cmdbuf, [] { });
-      }
-      NSObject_release(pool);
-
-      d9mt::logf("Presenter: proxy %ux%u created (vsync=%d)",
-        extent.width, extent.height, m_preferredSyncInterval != 0u ? 1 : 0);
+      d9mt::logf("Presenter: %u proxy %ux%u created (vsync=%d)",
+        N, extent.width, extent.height, m_preferredSyncInterval != 0u ? 1 : 0);
     }
 
     m_dirtySwapchain = false;

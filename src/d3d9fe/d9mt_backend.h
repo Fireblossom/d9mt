@@ -248,6 +248,17 @@ namespace dxvk::d9mt {
   void watcherWaitIdle();
 
   // -------------------------------------------------------------------------
+  // device-lost (d9mt_watcher.cpp). Set when a submitted command buffer fails
+  // to complete within the GPU watchdog timeout (D9MT_GPU_TIMEOUT_MS, default
+  // 5000 ms) — i.e. the GPU/driver hung. Sticky: once set, the completion
+  // watcher stops waiting on further command buffers (fails open so nothing
+  // blocks) and the presenter reports VK_ERROR_DEVICE_LOST, turning an
+  // unkillable freeze into a responsive, cleanly-quittable device-loss.
+  // -------------------------------------------------------------------------
+  void setDeviceLost();
+  bool isDeviceLost();
+
+  // -------------------------------------------------------------------------
   // command-list encoder bridge (implemented in d9mt_context.cpp, welded to
   // the command-list side state there). Used by the swapchain blitter
   // (d9mt_presenter.cpp) to encode raw Metal work onto a DxvkCommandList
