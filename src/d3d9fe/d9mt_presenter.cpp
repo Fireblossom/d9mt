@@ -1141,6 +1141,25 @@ namespace dxvk {
   }
 
 
+  // An MSAA present source can't carry a Metal view swizzle (Metal forbids
+  // swizzled MSAA views, so it was dropped at view creation), so the resolve
+  // path samples the *raw* resolved texture. That is still a correct *opaque*
+  // present as long as the swizzle passes R,G,B straight through — only alpha
+  // may be remapped (e.g. D3DFMT_X8R8G8B8 -> BGRA8 forces A=ONE), and the present
+  // layer is opaque so its alpha is ignored by the compositor. A real colour
+  // reorder (R<->B etc.) still can't be handled this way.
+  static bool d9mtPresentSwizzleOk(uint16_t packedSwizzle) {
+    if (!packedSwizzle)
+      return true;
+    auto ch = [&](int shift) {
+      return VkComponentSwizzle((packedSwizzle >> shift) & 0xf);
+    };
+    return (ch(0) == VK_COMPONENT_SWIZZLE_IDENTITY || ch(0) == VK_COMPONENT_SWIZZLE_R)
+        && (ch(4) == VK_COMPONENT_SWIZZLE_IDENTITY || ch(4) == VK_COMPONENT_SWIZZLE_G)
+        && (ch(8) == VK_COMPONENT_SWIZZLE_IDENTITY || ch(8) == VK_COMPONENT_SWIZZLE_B);
+  }
+
+
   void DxvkSwapchainBlitter::present(
     const Rc<DxvkCommandList>&ctx,
     const Rc<DxvkImageView>&  dstView,
@@ -1184,10 +1203,12 @@ namespace dxvk {
     // conversion, swizzle, and gamma for free.
     if (srcView->image()->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
       WMTPixelFormat sF = d9mt::wmtFormatFor(srcView->info().format);
-      if (sF == WMTPixelFormatInvalid || srcView->info().packedSwizzle) {
+      if (sF == WMTPixelFormatInvalid
+       || !d9mtPresentSwizzleOk(srcView->info().packedSwizzle)) {
         if (!bs.warnedMsaa) {
           bs.warnedMsaa = true;
-          Logger::err("d9mt: blitter: MSAA present source has no plain Metal format — skipping");
+          Logger::err("d9mt: blitter: MSAA present source has no plain Metal format "
+            "or reorders colour channels — skipping");
         }
         return;
       }
