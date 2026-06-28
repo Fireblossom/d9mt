@@ -380,8 +380,9 @@ namespace dxvk {
     // off to the macOS app-termination handshake. Left running, the idle
     // watcher is parked in a Wine syscall and interlocks with
     // -[NSApplication _shouldTerminate], wedging process exit (the long
-    // standing quit hang). Drain first so any in-flight callbacks still run.
-    d9mt::watcherWaitIdle();
+    // standing quit hang). watcherStop() drains then stops, and is a no-op if
+    // the watcher was never created (e.g. a startup adapter-probe instance) —
+    // so it must NOT be preceded by anything that forces the watcher to exist.
     d9mt::watcherStop();
 
     wsi::quit();

@@ -233,8 +233,14 @@ namespace dxvk::d9mt {
   // wsi::quit(), so the thread is gone before the macOS termination handshake.
   // No-op if the watcher was never created.
   void watcherStop() {
-    if (g_watcher)
-      g_watcher->stop();
+    // Only act if the watcher was actually created (i.e. rendering happened).
+    // A startup adapter-probe instance never creates it, so its
+    // ~DxvkInstance must NOT spawn-then-kill the singleton — that would leave a
+    // dead watcher for the real rendering instance (= startup hang).
+    if (!g_watcher)
+      return;
+    g_watcher->waitIdle();   // drain any in-flight completion callbacks
+    g_watcher->stop();       // make run() return so the thread terminates
   }
 
 }
